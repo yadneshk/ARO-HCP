@@ -13,6 +13,8 @@ Correlated Microsoft TSG sources (do not duplicate their runbook steps here):
 | [ARO-HCP query cookbook](../ai/query-cookbook.md)                                                                                                                                                                         | `hcpctl snapshot` canned queries                                   |
 
 
+
+
 ## Failure modes
 
 1. [Cluster Stuck in Deleting](#1-cluster-stuck-in-deleting)
@@ -21,6 +23,8 @@ Correlated Microsoft TSG sources (do not duplicate their runbook steps here):
 4. [Orphaned Azure Resources](#4-orphaned-azure-resources)
 5. [Node Pool Delete Stuck](#5-node-pool-delete-stuck)
 6. [Deletion Blocked by Missing Managed Identities](#6-deletion-blocked-by-missing-managed-identities)
+
+
 
 ## Prerequisites
 
@@ -49,6 +53,8 @@ Correlated Microsoft TSG sources (do not duplicate their runbook steps here):
 
 > **Schema gotcha** (from Kusto Cookbook): `frontendLogs.level` and `backendLogs.level` are **UPPERCASE** — use `level == "ERROR"`, not `"error"`.
 
+
+
 ## Deletion architecture
 
 Cluster deletion flows top-down:
@@ -75,6 +81,8 @@ ARM DELETE → RP Frontend (Cosmos: Deleting, deletionTimestamp)
 
 ---
 
+
+
 ## Step 0: Discovery — map Resource ID to internal identifiers
 
 Run this before layer-specific queries (aligned with Kusto Cookbook Step 0). You need `{CID}`  for HyperShift/CAPZ queries.
@@ -94,11 +102,15 @@ If CID lookup returns nothing, widen the window to `ago(7d)` or confirm the corr
 
 ---
 
+
+
 ## 1. Cluster Stuck in Deleting
 
 **Symptom:** Cluster stays in `provisioningState: Deleting` well beyond the deletion SLO (~45 minutes in E2E).
 
 > **Fast path:** Run Steps 1, 3, and 4 first. If CS is stuck at `uninstalling` in Step 4, continue to Steps 5 and 6 to localize the Maestro/HyperShift layer.
+
+
 
 ### Step 1: Confirm the delete request was accepted
 
@@ -127,18 +139,16 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | where log.controller_name == 'datadump'
 | where log.content.resourceID has "{RESOURCE_ID}/nodePools"
 | summarize content = take_any(log.content), observedTime = min(timestamp) by etag = tostring(log.content._etag)
-| sort by observedTime asc
+| sort by observedTime desc
 | extend content = parse_json(content)
 | project
     observedTime,
     nodePoolId = tostring(content.resourceID),
-    provisioningState = tostring(content.properties.provisioningState),
-    deletionTimestamp = content.properties.deletionTimestamp,
-    clusterServiceID = tostring(content.serviceProviderProperties.clusterServiceID),
-    clusterServiceDeletionTimestamp = content.serviceProviderProperties.clusterServiceDeletionTimestamp
+    provisioningState = tostring(content.properties.intermediateResourceDoc.provisioningState)
+| where provisioningState != ''
 ```
 
-If any child shows `provisioningState: Deleting`, jump to [§5 Node Pool Delete Stuck](#5-node-pool-delete-stuck).
+If any child shows `provisioningState: Deleting`, jump to [§5 Node Pool Delete Stuck](#5-node-pool-delete-stuck). The entire purpose of this query is to find node pools that are actively blocking cluster deletion, and only `Deleting` state does that. Any other state (empty, Succeeded, etc.) means the node pool isn't a blocker.
 
 ### Step 3: Backend deletion pipeline controller conditions
 
@@ -172,13 +182,17 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 
 **Look for:** any controller with `Degraded=True`. The `controller_name`, `reason`, and `message` columns together identify which pipeline stage broke and why:
 
-| Controller | `Degraded=True` means |
-| --- | --- |
-| `ClusterClusterServiceDeleteDispatch` | Could not dispatch delete to CS |
-| `ClusterDeletionClusterServiceIDClearer` | CS polling failed or timed out |
-| `ClusterChildResourcesCleanupController` | Child Cosmos doc or Maestro bundle cleanup failed |
-| `ClusterDeletionController` | Final Cosmos delete failed, or a gate is not clearing |
-| `OperationClusterDelete` | Could not update the ARM operation status |
+
+| Controller                               | `Degraded=True` means                                 |
+| ---------------------------------------- | ----------------------------------------------------- |
+| `ClusterClusterServiceDeleteDispatch`    | Could not dispatch delete to CS                       |
+| `ClusterDeletionClusterServiceIDClearer` | CS polling failed or timed out                        |
+| `ClusterChildResourcesCleanupController` | Child Cosmos doc or Maestro bundle cleanup failed     |
+| `ClusterDeletionController`              | Final Cosmos delete failed, or a gate is not clearing |
+| `OperationClusterDelete`                 | Could not update the ARM operation status             |
+
+
+
 
 ### Step 4: CS state and destruct chain
 
@@ -261,6 +275,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').containerLogs
 
 ---
 
+
+
 ## 2. Delete Operation Never Completes, Still Listed
 
 **Symptom:** Async ARM operation stays `InProgress`; cluster still appears in Portal/`az resource list` with `provisioningState: Deleting`.
@@ -315,6 +331,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | `activeOperationID` empty while `Deleting`                      | Broken operation link      |
 
 
+
+
 ### Step 3: Async operation polling (frontend)
 
 ```kql
@@ -330,6 +348,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('frontendLogs')
 **Stuck:** Only `200` responses — operation never reached a terminal state.
 
 ---
+
+
 
 ## 3. Delete Operation Fails
 
@@ -348,6 +368,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | order by timestamp desc
 ```
 
+
+
 ### Step 2: CS error state
 
 ```kql
@@ -359,6 +381,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').clustersServiceLogs
 | project timestamp, msg = tostring(log.msg), level
 | order by timestamp asc
 ```
+
+
 
 ### Step 3: Inflight check failures
 
@@ -376,6 +400,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 **Remediation:** Re-issue DELETE after a failed operation (frontend accepts new delete requests).
 
 ---
+
+
 
 ## 4. Orphaned Azure Resources
 
@@ -395,6 +421,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | project managedResourceGroup = tostring(content.properties.platform.managedResourceGroup),
           subnetId = tostring(content.properties.platform.subnetId)
 ```
+
+
 
 ### Step 2: CAPZ deletion errors
 
@@ -425,6 +453,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').containerLogs
 
 ---
 
+
+
 ## 5. Node Pool Delete Stuck
 
 **Symptom:** Node pool stays in `provisioningState: Deleting` for hours. Covered in detail by the [Node Pool Management TSG](https://dev.azure.com/msazure/One/_git/Azure-Documents-Common?path=/Teams/Azure%20RedHat%20OpenShift/doc/hcp/troubleshooting/node-pool-management-tsg.md) (drain timeout, last-pool validation, CAPI machine state).
@@ -442,6 +472,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('frontendLogs')
 | project timestamp, response_status_code, correlation_request_id, client_request_id
 | order by timestamp desc
 ```
+
+
 
 ### Step 2: Node pool Cosmos document state
 
@@ -468,6 +500,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | `deletionTimestamp` set, `clusterServiceDeletionTimestamp` null | `NodePoolClusterServiceDeleteDispatch`                         |
 | `clusterServiceID` still set                                    | Waiting for CS 404 (`NodePoolDeletionClusterServiceIDClearer`) |
 | Document persists, CS ID cleared                                | Maestro bundles or child docs (`NodePoolDeletionController`)   |
+
+
 
 
 ### Step 3: Node pool deletion controller conditions
@@ -520,6 +554,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | project csNodePool
 ```
 
+
+
 ### Step 5: Maestro readonly bundles blocking delete
 
 ```kql
@@ -545,6 +581,8 @@ Run the CAPZ query from [§4 Step 2](#step-2-capz-deletion-errors) scoped to `{C
 
 ---
 
+
+
 ## 6. Deletion Blocked by Missing Managed Identities
 
 **Symptom:** Cluster or node pool deletion stuck; CAPZ logs show AAD errors like `AADSTS700016: Application with identifier '...' was not found`. Full remediation is in the [Managed Identities Not Found runbook](https://dev.azure.com/msazure/One/_git/Azure-Documents-Common?path=/Teams/Azure%20RedHat%20OpenShift/doc/hcp/runbooks/cluster-deletion/managed-identities-not-found.md).
@@ -564,6 +602,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | order by timestamp asc
 ```
 
+
+
 ### Step 2: CAPZ AAD / identity errors
 
 ```kql
@@ -581,6 +621,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').containerLogs
 **Next steps:** Break-glass to management cluster, inspect `AzureMachine` CRs in the control-plane namespace, remove finalizers only when machines have `deletionTimestamp` — see the external runbook above and [cleanup-stuck-cluster-deletion.md](cleanup-stuck-cluster-deletion.md).
 
 ---
+
+
 
 ## Appendix A: Kusto cluster URIs
 
@@ -604,6 +646,8 @@ See [logging.md](../logging.md) and the [Kusto Cookbook](https://dev.azure.com/m
 | `clustersServiceLogs`                  | ServiceLogs            | CS phase transitions, `cid`, destruct chain                    |
 | `containerLogs`                        | Both                   | Maestro, HyperShift operator                                   |
 | `HostedControlPlaneLogs.containerLogs` | HostedControlPlaneLogs | CAPZ, CAPI manager                                             |
+
+
 
 
 ## Appendix C: Related docs
