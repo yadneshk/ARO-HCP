@@ -165,12 +165,13 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | sort by observedTime asc
 | extend content = parse_json(content)
 | extend controller_name = extract("/hcpOpenShiftControllers/([^\\/]+)", 1, tostring(content.resourceID))
-| where controller_name in (
+| where controller_name has_any (
     'OperationClusterDelete',
     'ClusterClusterServiceDeleteDispatch',
     'ClusterDeletionClusterServiceIDClearer',
     'ClusterChildResourcesCleanupController',
-    'ClusterDeletionController'
+    'ClusterDeletionController',
+    'NodePoolDeleteController'
   )
 | mv-expand condition = content.properties.status.conditions
 | project observedTime, lastTransitionTime = todatetime(condition.lastTransitionTime),
