@@ -89,11 +89,11 @@ Run this before layer-specific queries (aligned with Kusto Cookbook Step 0). You
 let resourceId = "{RESOURCE_ID}";
 let start_time = ago(24h);
 cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').clustersServiceLogs
-    | where timestamp >= start_time
-    | where log.aro_hcp_cluster_resource_id =~ resourceId
-    | where tostring(cid) != ''
-    | take 1
-    | project cid;
+| where timestamp >= start_time
+| where log.aro_hcp_cluster_resource_id =~ resourceId
+| where tostring(cid) != ''
+| take 1
+| project cid;
 ```
 
 If CID lookup returns nothing, widen the window to `ago(7d)` or confirm the correct regional Kusto cluster.
@@ -101,195 +101,15 @@ If CID lookup returns nothing, widen the window to `ago(7d)` or confirm the corr
 ---
 
 
-
 ## 1. Cluster Stuck in Deleting
 
-**Symptom:** Cluster stays in `provisioningState: Deleting` well beyond the deletion SLO (~45 minutes in E2E), or the async ARM operation stays `InProgress` with no sign of progress.
+**Symptom:** Cluster stays in `provisioningState: Deleting` well beyond the deletion SLO or the async ARM operation stays `InProgress` with no sign of progress.
 
 > **Fast path:** Run Steps 1, 2, and 4 first. Step 2 locates where in the pipeline the blockage is; Step 4 confirms which controller is degraded. Only continue to Steps 5–7 if CS is stuck at `uninstalling`.
 
-### Step 1: Confirm the delete request was accepted
+### Step 1: HyperShift operator and CAPI manager
 
-```kql
-cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('frontendLogs')
-| where timestamp between ({START_TIME} .. {END_TIME})
-| where namespace_name == "aro-hcp"
-| where container_name == "aro-hcp-frontend"
-| where resource_id =~ "{RESOURCE_ID}"
-| where request_method == "delete"
-| where msg == "response complete"
-| project timestamp, response_status_code, correlation_request_id, client_request_id, duration
-| order by timestamp desc
-```
-
-**Expected:** `202`. `409` = already deleting. Save `correlation_request_id` for tracing.
-
-### Step 2: ARM operation and service-provider state
-
-Quickly locates which layer the deletion is blocked at before digging deeper.
-
-```kql
-// Operation document — is it stuck and does it carry an error?
-cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
-| where timestamp between ({START_TIME} .. {END_TIME})
-| where container_name == 'aro-hcp-backend'
-| where log.controller_name == 'datadump'
-| where log.resource_group == '{RESOURCE_GROUP}'
-| where log.resource_name == '{CLUSTER_NAME}'
-| where log.content.resourceType =~ 'microsoft.redhatopenshift/hcpoperationsstatus'
-| summarize content = take_any(log.content), observedTime = min(timestamp) by etag = tostring(log.content._etag)
-| sort by observedTime asc
-| extend content = parse_json(content)
-| where tostring(content.properties.request) == 'Delete'
-| project observedTime, operationId = tostring(content.resourceID),
-          status = tostring(content.properties.status), error = content.properties.error,
-          lastUpdated = todatetime(content.properties.lastUpdatedTime)
-```
-
-```kql
-// Service-provider state — where did CS dispatch stall?
-cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
-| where timestamp between ({START_TIME} .. {END_TIME})
-| where container_name == 'aro-hcp-backend'
-| where log.controller_name == 'datadump'
-| where log.resource_group == '{RESOURCE_GROUP}'
-| where log.resource_name == '{CLUSTER_NAME}'
-| where log.content.resourceType =~ 'microsoft.redhatopenshift/hcpopenshiftclusters/serviceproviders'
-| summarize content = take_any(log.content), observedTime = min(timestamp) by etag = tostring(log.content._etag)
-| sort by observedTime asc
-| extend content = parse_json(content)
-| project observedTime,
-          clusterServiceID = tostring(content.properties.clusterServiceID),
-          activeOperationID = tostring(content.properties.activeOperationID),
-          provisioningState = tostring(content.properties.provisioningState),
-          deletionTimestamp = content.properties.deletionTimestamp,
-          clusterServiceDeletionTimestamp = content.properties.clusterServiceDeletionTimestamp
-```
-
-
-| Signal                                                          | Likely cause               |
-| --------------------------------------------------------------- | -------------------------- |
-| `deletionTimestamp` set, `clusterServiceDeletionTimestamp` null | CS delete never dispatched |
-| `clusterServiceID` still present                                | CS has not confirmed 404   |
-| `activeOperationID` empty while `Deleting`                      | Broken operation link      |
-
-
-### Step 3: Check child node pools blocking cluster deletion
-
-Cluster deletion waits for all child node pool Cosmos documents to be gone. Node pools do not transition to a `Deleted` state — their documents are removed entirely. An empty result here means no node pools are blocking.
-
-```kql
-cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
-| where timestamp between ({START_TIME} .. {END_TIME})
-| where container_name == 'aro-hcp-backend'
-| where log.controller_name == 'datadump'
-| where log.content.resourceID has "{RESOURCE_ID}/nodePools"
-| summarize content = take_any(log.content), observedTime = max(timestamp) by tostring(log.content.resourceID)
-| extend content = parse_json(content)
-| project
-    observedTime,
-    nodePoolId = tostring(content.resourceID),
-    provisioningState = tostring(content.properties.provisioningState),
-    deletionTimestamp = content.serviceProviderProperties.deletionTimestamp,
-    clusterServiceDeletionTimestamp = content.serviceProviderProperties.clusterServiceDeletionTimestamp,
-    clusterServiceID = tostring(content.serviceProviderProperties.clusterServiceID),
-    usesNewDeletion = content.serviceProviderProperties.usesNewNodePoolDeletionApproach
-| where provisioningState == 'Deleting'
-```
-
-| Field pattern                                                   | Stuck stage                                                    |
-| --------------------------------------------------------------- | -------------------------------------------------------------- |
-| `deletionTimestamp` set, `clusterServiceDeletionTimestamp` null | `NodePoolClusterServiceDeleteDispatch`                         |
-| `clusterServiceID` still set                                    | Waiting for CS 404 (`NodePoolDeletionClusterServiceIDClearer`) |
-| Both CS fields cleared, doc still present                       | Maestro bundles or child docs (`NodePoolDeletionController`)   |
-
-If any node pool is returned, jump to [§4 Node Pool Delete Stuck](#4-node-pool-delete-stuck).
-
-### Step 4: Backend deletion pipeline controller conditions
-
-```kql
-cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
-| where timestamp between ({START_TIME} .. {END_TIME})
-| where container_name == 'aro-hcp-backend'
-| where log.controller_name == 'datadump'
-| where log.resource_group == '{RESOURCE_GROUP}'
-| where log.resource_name == '{CLUSTER_NAME}'
-| where log.content.resourceType =~ 'microsoft.redhatopenshift/hcpopenshiftclusters/hcpopenshiftcontrollers'
-| where log.content.resourceID has '{CLUSTER_NAME}'
-| summarize content = take_any(log.content), observedTime = min(timestamp) by etag = tostring(log.content._etag)
-| sort by observedTime asc
-| extend content = parse_json(content)
-| extend controller_name = extract("/hcpOpenShiftControllers/([^\\/]+)", 1, tostring(content.resourceID))
-| where controller_name in (
-    'OperationClusterDelete',
-    'ClusterClusterServiceDeleteDispatch',
-    'ClusterDeletionClusterServiceIDClearer',
-    'ClusterChildResourcesCleanupController',
-    'ClusterDeletionController'
-  )
-| mv-expand condition = content.properties.status.conditions
-| project observedTime, lastTransitionTime = todatetime(condition.lastTransitionTime),
-          controller_name, type = tostring(condition.type), status = tostring(condition.status),
-          reason = tostring(condition.reason), message = tostring(condition.message)
-| summarize observedTime = min(observedTime) by lastTransitionTime, controller_name, type, status, reason, message
-| order by lastTransitionTime asc
-```
-
-**Look for:** any controller with `Degraded=True`. The `controller_name`, `reason`, and `message` columns together identify which pipeline stage broke and why:
-
-| Controller | `Degraded=True` means |
-| --- | --- |
-| `ClusterClusterServiceDeleteDispatch` | Could not dispatch delete to CS |
-| `ClusterDeletionClusterServiceIDClearer` | CS polling failed or timed out |
-| `ClusterChildResourcesCleanupController` | Child Cosmos doc or Maestro bundle cleanup failed |
-| `ClusterDeletionController` | Final Cosmos delete failed, or a gate is not clearing |
-| `OperationClusterDelete` | Could not update the ARM operation status |
-
-### Step 5: CS deletion activity
-
-```kql
-// Full CS deletion timeline — read top-to-bottom to see what CS did and where it stopped
-cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').clustersServiceLogs
-| where timestamp between ({START_TIME} .. {END_TIME})
-| where log.aro_hcp_cluster_resource_id =~ '{RESOURCE_ID}'
-| where isempty(log.aro_hcp_node_pool_resource_id)
-| project timestamp, level, msg = tostring(log.msg)
-| order by timestamp asc
-```
-
-```kql
-// Errors and key deletion events only — use if the full timeline is too noisy
-cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').clustersServiceLogs
-| where timestamp between ({START_TIME} .. {END_TIME})
-| where log.aro_hcp_cluster_resource_id =~ '{RESOURCE_ID}'
-| where isempty(log.aro_hcp_node_pool_resource_id)
-| where level == 'ERROR'
-    or log.msg has_any ('state', 'destruct', 'delet', 'chain', 'ManifestWork', 'uninstall', 'Skipping')
-| project timestamp, level, msg = tostring(log.msg)
-| order by timestamp asc
-```
-
-**Stuck signal:** The last log entry shows where CS stopped. Look for: `"Running chain deletion to clean deleted cluster"` repeating, `"Not continuing to the next destructor"`, `"Skipping ManifestWork ... as it contains namespaces"` (orphaned namespace bundles — see [fix-maestro-stale-resource-bundle.md](fix-maestro-stale-resource-bundle.md)).
-
-### Step 6: Maestro transition matrix
-
-Localizes service ↔ management cluster delivery failures. See [query cookbook § Maestro](../ai/query-cookbook.md) for the full 7-layer query; abbreviated pattern:
-
-```kql
-cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').containerLogs
-| where timestamp between ({START_TIME} .. {END_TIME})
-| where namespace_name == 'maestro'
-| where container_name in ('maestro-server', 'maestro-agent')
-| extend logs = tostring(log)
-| where logs has '{CID}'
-| extend msg = extract('] "([^"]+)"', 1, logs)
-| summarize count = count() by container_name, msg
-| order by count desc
-```
-
-For deletion, confirm delete events reach the agent (`Received event`, `Server side applied`). A break between adjacent layers in the full matrix query indicates where delivery stopped.
-
-### Step 7: HyperShift operator and CAPI manager
+This usually helps to rule out whether cluster is stuck in deleting due to node pool deletion not making any progress
 
 ```kql
 // HyperShift operator — fleet-wide filter by CID
@@ -299,7 +119,7 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').containerLogs
 | where container_name == 'operator'
 | extend log_str = tostring(log)
 | where log_str has '{CID}'
-| where log_str has_any ('error', 'failed', 'delet')
+| where log_str has_any ('error', 'failed', 'delet', 'Waiting')
 | project timestamp, log_str
 | order by timestamp desc
 | take 100
@@ -312,15 +132,12 @@ cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').containerLogs
 | where namespace_name has '{CID}'
 | where container_name == 'manager'
 | extend log_str = tostring(log)
-| where log_str has_any ('failed', 'error', 'delet')
+| where log_str has_any ('failed', 'error', 'delet', 'Waiting')
 | project timestamp, pod_name, log_str
 | order by timestamp desc
 | take 100
 ```
 
-**Common patterns:** `"Waiting for namespace deletion"` (CP namespace terminating); `"hostedcluster is still deleting"` (finalizers); `ResourceGroupNotFound` (managed RG deleted externally).
-
-**Remediation:** See [cleanup-stuck-cluster-deletion.md](cleanup-stuck-cluster-deletion.md).
 
 ---
 
@@ -584,7 +401,194 @@ cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').containerLogs
 
 ---
 
+## 6. Deep dive into cluster deletion workflow
 
+
+### Step 1: Confirm the delete request was accepted
+
+```kql
+cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('frontendLogs')
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where namespace_name == "aro-hcp"
+| where container_name == "aro-hcp-frontend"
+| where resource_id =~ "{RESOURCE_ID}"
+| where request_method == "delete"
+| where msg == "response complete"
+| project timestamp, response_status_code, correlation_request_id, client_request_id, duration
+| order by timestamp desc
+```
+
+**Expected:** `202`. `409` = already deleting. Save `correlation_request_id` for tracing.
+
+### Step 2: ARM operation and service-provider state
+
+Quickly locates which layer the deletion is blocked at before digging deeper.
+
+```kql
+// Operation document — is it stuck and does it carry an error?
+cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where container_name == 'aro-hcp-backend'
+| where log.controller_name == 'datadump'
+| where log.resource_group == '{RESOURCE_GROUP}'
+| where log.resource_name == '{CLUSTER_NAME}'
+| where log.content.resourceType =~ 'microsoft.redhatopenshift/hcpoperationsstatus'
+| summarize content = take_any(log.content), observedTime = min(timestamp) by etag = tostring(log.content._etag)
+| sort by observedTime asc
+| extend content = parse_json(content)
+| where tostring(content.properties.request) == 'Delete'
+| project observedTime, operationId = tostring(content.resourceID),
+          status = tostring(content.properties.status), error = content.properties.error,
+          lastUpdated = todatetime(content.properties.lastUpdatedTime)
+```
+
+```kql
+// Service-provider state — where did CS dispatch stall?
+cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where container_name == 'aro-hcp-backend'
+| where log.controller_name == 'datadump'
+| where log.resource_group == '{RESOURCE_GROUP}'
+| where log.resource_name == '{CLUSTER_NAME}'
+| where log.content.resourceType =~ 'microsoft.redhatopenshift/hcpopenshiftclusters/serviceproviders'
+| summarize content = take_any(log.content), observedTime = min(timestamp) by etag = tostring(log.content._etag)
+| sort by observedTime asc
+| extend content = parse_json(content)
+| project observedTime,
+          clusterServiceID = tostring(content.properties.clusterServiceID),
+          activeOperationID = tostring(content.properties.activeOperationID),
+          provisioningState = tostring(content.properties.provisioningState),
+          deletionTimestamp = content.properties.deletionTimestamp,
+          clusterServiceDeletionTimestamp = content.properties.clusterServiceDeletionTimestamp
+```
+
+
+| Signal                                                          | Likely cause               |
+| --------------------------------------------------------------- | -------------------------- |
+| `deletionTimestamp` set, `clusterServiceDeletionTimestamp` null | CS delete never dispatched |
+| `clusterServiceID` still present                                | CS has not confirmed 404   |
+| `activeOperationID` empty while `Deleting`                      | Broken operation link      |
+
+
+### Step 3: Check child node pools blocking cluster deletion
+
+Cluster deletion waits for all child node pool Cosmos documents to be gone. Node pools do not transition to a `Deleted` state — their documents are removed entirely. An empty result here means no node pools are blocking.
+
+```kql
+cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where container_name == 'aro-hcp-backend'
+| where log.controller_name == 'datadump'
+| where log.content.resourceID has "{RESOURCE_ID}/nodePools"
+| summarize content = take_any(log.content), observedTime = max(timestamp) by tostring(log.content.resourceID)
+| extend content = parse_json(content)
+| project
+    observedTime,
+    nodePoolId = tostring(content.resourceID),
+    provisioningState = tostring(content.properties.provisioningState),
+    deletionTimestamp = content.serviceProviderProperties.deletionTimestamp,
+    clusterServiceDeletionTimestamp = content.serviceProviderProperties.clusterServiceDeletionTimestamp,
+    clusterServiceID = tostring(content.serviceProviderProperties.clusterServiceID),
+    usesNewDeletion = content.serviceProviderProperties.usesNewNodePoolDeletionApproach
+| where provisioningState == 'Deleting'
+```
+
+| Field pattern                                                   | Stuck stage                                                    |
+| --------------------------------------------------------------- | -------------------------------------------------------------- |
+| `deletionTimestamp` set, `clusterServiceDeletionTimestamp` null | `NodePoolClusterServiceDeleteDispatch`                         |
+| `clusterServiceID` still set                                    | Waiting for CS 404 (`NodePoolDeletionClusterServiceIDClearer`) |
+| Both CS fields cleared, doc still present                       | Maestro bundles or child docs (`NodePoolDeletionController`)   |
+
+If any node pool is returned, jump to [§4 Node Pool Delete Stuck](#4-node-pool-delete-stuck).
+
+### Step 4: Backend deletion pipeline controller conditions
+
+```kql
+cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where container_name == 'aro-hcp-backend'
+| where log.controller_name == 'datadump'
+| where log.resource_group == '{RESOURCE_GROUP}'
+| where log.resource_name == '{CLUSTER_NAME}'
+| where log.content.resourceType =~ 'microsoft.redhatopenshift/hcpopenshiftclusters/hcpopenshiftcontrollers'
+| where log.content.resourceID has '{CLUSTER_NAME}'
+| summarize content = take_any(log.content), observedTime = min(timestamp) by etag = tostring(log.content._etag)
+| sort by observedTime asc
+| extend content = parse_json(content)
+| extend controller_name = extract("/hcpOpenShiftControllers/([^\\/]+)", 1, tostring(content.resourceID))
+| where controller_name in (
+    'OperationClusterDelete',
+    'ClusterClusterServiceDeleteDispatch',
+    'ClusterDeletionClusterServiceIDClearer',
+    'ClusterChildResourcesCleanupController',
+    'ClusterDeletionController'
+  )
+| mv-expand condition = content.properties.status.conditions
+| project observedTime, lastTransitionTime = todatetime(condition.lastTransitionTime),
+          controller_name, type = tostring(condition.type), status = tostring(condition.status),
+          reason = tostring(condition.reason), message = tostring(condition.message)
+| summarize observedTime = min(observedTime) by lastTransitionTime, controller_name, type, status, reason, message
+| order by lastTransitionTime asc
+```
+
+**Look for:** any controller with `Degraded=True`. The `controller_name`, `reason`, and `message` columns together identify which pipeline stage broke and why:
+
+| Controller | `Degraded=True` means |
+| --- | --- |
+| `ClusterClusterServiceDeleteDispatch` | Could not dispatch delete to CS |
+| `ClusterDeletionClusterServiceIDClearer` | CS polling failed or timed out |
+| `ClusterChildResourcesCleanupController` | Child Cosmos doc or Maestro bundle cleanup failed |
+| `ClusterDeletionController` | Final Cosmos delete failed, or a gate is not clearing |
+| `OperationClusterDelete` | Could not update the ARM operation status |
+
+### Step 5: CS deletion activity
+
+```kql
+// Full CS deletion timeline — read top-to-bottom to see what CS did and where it stopped
+cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').clustersServiceLogs
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where log.aro_hcp_cluster_resource_id =~ '{RESOURCE_ID}'
+| where isempty(log.aro_hcp_node_pool_resource_id)
+| project timestamp, level, msg = tostring(log.msg)
+| order by timestamp asc
+```
+
+```kql
+// Errors and key deletion events only — use if the full timeline is too noisy
+cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').clustersServiceLogs
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where log.aro_hcp_cluster_resource_id =~ '{RESOURCE_ID}'
+| where isempty(log.aro_hcp_node_pool_resource_id)
+| where level == 'ERROR'
+    or log.msg has_any ('state', 'destruct', 'delet', 'chain', 'ManifestWork', 'uninstall', 'Skipping')
+| project timestamp, level, msg = tostring(log.msg)
+| order by timestamp asc
+```
+
+**Stuck signal:** The last log entry shows where CS stopped. Look for: `"Running chain deletion to clean deleted cluster"` repeating, `"Not continuing to the next destructor"`, `"Skipping ManifestWork ... as it contains namespaces"` (orphaned namespace bundles — see [fix-maestro-stale-resource-bundle.md](fix-maestro-stale-resource-bundle.md)).
+
+### Step 6: Maestro transition matrix
+
+Localizes service ↔ management cluster delivery failures. See [query cookbook § Maestro](../ai/query-cookbook.md) for the full 7-layer query; abbreviated pattern:
+
+```kql
+cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').containerLogs
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where namespace_name == 'maestro'
+| where container_name in ('maestro-server', 'maestro-agent')
+| extend logs = tostring(log)
+| where logs has '{CID}'
+| extend msg = extract('] "([^"]+)"', 1, logs)
+| summarize count = count() by container_name, msg
+| order by count desc
+```
+
+For deletion, confirm delete events reach the agent (`Received event`, `Server side applied`). A break between adjacent layers in the full matrix query indicates where delivery stopped.
+
+
+**Common patterns:** `"Waiting for namespace deletion"` (CP namespace terminating); `"hostedcluster is still deleting"` (finalizers); `ResourceGroupNotFound` (managed RG deleted externally).
+
+**Remediation:** See [cleanup-stuck-cluster-deletion.md](cleanup-stuck-cluster-deletion.md).
 
 ## Appendix A: Kusto cluster URIs
 
