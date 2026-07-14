@@ -14,6 +14,7 @@ Correlated Microsoft TSG sources (do not duplicate their runbook steps here):
 
 
 
+
 ## Failure modes
 
 1. [Cluster Stuck in Deleting](#1-cluster-stuck-in-deleting)
@@ -66,6 +67,22 @@ ARM DELETE → RP Frontend (Cosmos: Deleting, deletionTimestamp)
           → HostedCluster / ManagedCluster deletion
             → HyperShift + CAPZ remove Azure resources
               → Namespace + finalizer cleanup
+
+Clusters Service (sets state to "uninstalling")
+  → Maestro Server (deletes ResourceBundle)
+    → Maestro Agent (deletes ManifestWork on MGMT)
+      → ManifestWork cleanup (deletes HostedCluster, ManagedCluster, etc.)
+        → ManagedCluster destructor (hypershift-managed-cluster-destructor)
+          → ManagedClusterAddon pre-delete hooks (finalizer: hosting-addon-pre-delete)
+          → ManagedClusterAddon manifests cleanup (finalizer: hosting-manifests-cleanup)
+        → HostedCluster deletion (finalizer: hypershift.openshift.io/finalizer)
+          → NodePool deletion (finalizer: hypershift.openshift.io/finalizer)
+          → Control Plane namespace cleanup
+            → Deployments (finalizer: hypershift.openshift.io/component-finalizer)
+            → Cluster CRD (finalizer: cluster.cluster.x-k8s.io)
+            → HostedControlPlane (finalizer: hypershift.openshift.io/finalizer)
+            → MachineDeployment / MachineSet / Machine (CAPI finalizers)
+            → AzureMachine (finalizer: azuremachine.infrastructure.cluster.x-k8s.io)              
 ```
 
 
@@ -92,6 +109,7 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').clustersServiceLogs
 | where timestamp >= start_time
 | where log.aro_hcp_cluster_resource_id =~ resourceId
 | where tostring(cid) != ''
+| sort by timestamp desc
 | take 1
 | project cid;
 ```
@@ -100,12 +118,11 @@ If CID lookup returns nothing, widen the window to `ago(7d)` or confirm the corr
 
 ---
 
-
 ## 1. Cluster Stuck in Deleting
 
 **Symptom:** Cluster stays in `provisioningState: Deleting` well beyond the deletion SLO or the async ARM operation stays `InProgress` with no sign of progress.
 
-> **Fast path:** Run Steps 1, 2, and 4 first. Step 2 locates where in the pipeline the blockage is; Step 4 confirms which controller is degraded. Only continue to Steps 5–7 if CS is stuck at `uninstalling`.
+
 
 ### Step 1: HyperShift operator and CAPI manager
 
@@ -138,6 +155,13 @@ cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').containerLogs
 | take 100
 ```
 
+Example failures
+
+- Failed to remove finalizer
+
+```
+failed to remove finalizer from hostedcluster: hostedclusters.hypershift.openshift.io \"{CLUSTER_NAME}\" not found"
+```
 
 ---
 
@@ -155,37 +179,64 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | where container_name == 'aro-hcp-backend'
 | where resource_group == '{RESOURCE_GROUP}'
 | where resource_name == '{CLUSTER_NAME}'
-| where isnotempty(cloud_error_code) or isnotempty(cloud_error_message) or level == 'ERROR'
+| where isnotempty(cloud_error_code) or isnotempty(cloud_error_message)
 | project timestamp, operation, operation_id, cloud_error_code, cloud_error_message, msg, level
 | order by timestamp desc
 ```
 
-### Step 2: CS error state
+Example failures
+
+- Manifest work deletion is stuck
+
+
+
+### Step 2: Maestro server and agent
+
+```kql
+cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').containerLogs
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where namespace_name == 'maestro'
+| where container_name in ('maestro-server', 'maestro-agent')
+| extend logs = tostring(log)
+| where logs has '{CID}'
+| extend msg = extract('] "([^"]+)"', 1, logs)
+| extend resource_id = extract('resource[_]?id="([^"]+)"', 1, logs)
+| extend resource_name = extract('resource[_]?name="([^"]+)"', 1, logs)
+| extend manifest_work = extract('manifestwork[_]?name="([^"]+)"', 1, logs)
+| project timestamp, container_name, msg, resource_id, resource_name, manifest_work, logs
+| order by timestamp asc
+```
+
+Example failures
+
+- CID namespace not found
+  ```
+  "controller failed to sync" err="namespaces \"ocm-arohcpprod-{CID}-{CLUSTER_NAME}\" not found" key="<bundle-id>"
+
+  ```
+
+This means the control plane namespace on the management cluster is already gone, but the Maestro server still has a ResourceBundle pointing at it. The agent keeps trying to sync into a missing namespace and
+will never self-resolve.
+
+**Diagnosis:** The HostedCluster, NodePool, ManifestWork, and Machines are all gone on the management cluster. The namespace itself is deleted or terminating. CS cannot proceed because Maestro reports the bu
+ndle as not delivered.
+
+**Remediation:** Delete the stale resource bundle from the Maestro server — see [fix-maestro-stale-resource-bundle.md](fix-maestro-stale-resource-bundle.md). Once the bundle is removed, CS completes its dest
+ruct chain and the deletion pipeline proceeds.
+
+### Step 3: CS error state
 
 ```kql
 cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').clustersServiceLogs
 | where timestamp between ({START_TIME} .. {END_TIME})
 | where log.aro_hcp_cluster_resource_id =~ '{RESOURCE_ID}'
 | where isempty(log.aro_hcp_node_pool_resource_id)
-| where log has 'state to' or log has 'now in' or level == 'ERROR'
+| where log has 'state to' or log has 'now in'
 | project timestamp, msg = tostring(log.msg), level
 | order by timestamp asc
 ```
 
-### Step 3: Inflight check failures
-
-```kql
-cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
-| where timestamp between ({START_TIME} .. {END_TIME})
-| where container_name == 'aro-hcp-backend'
-| where resource_group == '{RESOURCE_GROUP}'
-| where resource_name == '{CLUSTER_NAME}'
-| where log has 'inflight' or log has 'OCM4001'
-| project timestamp, msg = tostring(log.msg), level
-| order by timestamp asc
-```
-
-**Remediation:** Re-issue DELETE after a failed operation (frontend accepts new delete requests).
+CS logs are only mildly helpful for delete failures. They rarely contain the root cause. If CS is already uninstalling and those messages are looping, stop digging in CS further.
 
 ---
 
@@ -209,6 +260,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | project managedResourceGroup = tostring(content.properties.platform.managedResourceGroup),
           subnetId = tostring(content.properties.platform.subnetId)
 ```
+
+
 
 ### Step 2: CAPZ deletion errors
 
@@ -259,6 +312,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('frontendLogs')
 | order by timestamp desc
 ```
 
+
+
 ### Step 2: Node pool Cosmos document state
 
 Node pools do not transition to a `Deleted` state — the document is removed entirely when deletion completes. If this query returns no rows, the node pool document is already gone (success).
@@ -285,6 +340,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | `deletionTimestamp` set, `clusterServiceDeletionTimestamp` null | `NodePoolClusterServiceDeleteDispatch`                         |
 | `clusterServiceID` still set                                    | Waiting for CS 404 (`NodePoolDeletionClusterServiceIDClearer`) |
 | Both CS fields cleared, doc still present                       | Maestro bundles or child docs (`NodePoolDeletionController`)   |
+
+
 
 
 ### Step 3: Node pool deletion controller conditions
@@ -337,6 +394,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | project csNodePool
 ```
 
+
+
 ### Step 5: Maestro readonly bundles blocking delete
 
 ```kql
@@ -383,6 +442,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | order by timestamp asc
 ```
 
+
+
 ### Step 2: CAPZ AAD / identity errors
 
 ```kql
@@ -401,7 +462,10 @@ cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').containerLogs
 
 ---
 
+
+
 ## 6. Deep dive into cluster deletion workflow
+
 
 
 ### Step 1: Confirm the delete request was accepted
@@ -470,6 +534,8 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | `activeOperationID` empty while `Deleting`                      | Broken operation link      |
 
 
+
+
 ### Step 3: Check child node pools blocking cluster deletion
 
 Cluster deletion waits for all child node pool Cosmos documents to be gone. Node pools do not transition to a `Deleted` state — their documents are removed entirely. An empty result here means no node pools are blocking.
@@ -493,11 +559,13 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | where provisioningState == 'Deleting'
 ```
 
+
 | Field pattern                                                   | Stuck stage                                                    |
 | --------------------------------------------------------------- | -------------------------------------------------------------- |
 | `deletionTimestamp` set, `clusterServiceDeletionTimestamp` null | `NodePoolClusterServiceDeleteDispatch`                         |
 | `clusterServiceID` still set                                    | Waiting for CS 404 (`NodePoolDeletionClusterServiceIDClearer`) |
 | Both CS fields cleared, doc still present                       | Maestro bundles or child docs (`NodePoolDeletionController`)   |
+
 
 If any node pool is returned, jump to [§4 Node Pool Delete Stuck](#4-node-pool-delete-stuck).
 
@@ -533,13 +601,17 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 
 **Look for:** any controller with `Degraded=True`. The `controller_name`, `reason`, and `message` columns together identify which pipeline stage broke and why:
 
-| Controller | `Degraded=True` means |
-| --- | --- |
-| `ClusterClusterServiceDeleteDispatch` | Could not dispatch delete to CS |
-| `ClusterDeletionClusterServiceIDClearer` | CS polling failed or timed out |
-| `ClusterChildResourcesCleanupController` | Child Cosmos doc or Maestro bundle cleanup failed |
-| `ClusterDeletionController` | Final Cosmos delete failed, or a gate is not clearing |
-| `OperationClusterDelete` | Could not update the ARM operation status |
+
+| Controller                               | `Degraded=True` means                                 |
+| ---------------------------------------- | ----------------------------------------------------- |
+| `ClusterClusterServiceDeleteDispatch`    | Could not dispatch delete to CS                       |
+| `ClusterDeletionClusterServiceIDClearer` | CS polling failed or timed out                        |
+| `ClusterChildResourcesCleanupController` | Child Cosmos doc or Maestro bundle cleanup failed     |
+| `ClusterDeletionController`              | Final Cosmos delete failed, or a gate is not clearing |
+| `OperationClusterDelete`                 | Could not update the ARM operation status             |
+
+
+
 
 ### Step 5: CS deletion activity
 
@@ -585,7 +657,6 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').containerLogs
 
 For deletion, confirm delete events reach the agent (`Received event`, `Server side applied`). A break between adjacent layers in the full matrix query indicates where delivery stopped.
 
-
 **Common patterns:** `"Waiting for namespace deletion"` (CP namespace terminating); `"hostedcluster is still deleting"` (finalizers); `ResourceGroupNotFound` (managed RG deleted externally).
 
 **Remediation:** See [cleanup-stuck-cluster-deletion.md](cleanup-stuck-cluster-deletion.md).
@@ -615,9 +686,11 @@ See [logging.md](../logging.md) and the [Kusto Cookbook](https://dev.azure.com/m
 
 
 
+
 ## Appendix C: Related docs
 
 - [Cleanup Procedure for Stuck Cluster Deletion](cleanup-stuck-cluster-deletion.md) — break-glass remediation
 - [Fix Maestro Stale Resource Bundle](fix-maestro-stale-resource-bundle.md)
 - [Kusto Query Cookbook](../ai/query-cookbook.md) — `hcpctl snapshot` query index
 - [HCP Cluster Creation Flow](hcp-cluster-creation-flow.md) — creation path (deletion is the inverse)
+
