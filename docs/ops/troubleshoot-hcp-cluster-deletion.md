@@ -48,6 +48,8 @@ Correlated Microsoft TSG sources (do not duplicate their runbook steps here):
 > | `{CORRELATION_ID}`            | From frontend delete response                           |
 > | `{ASYNC_OP_ID}`               | Operation ID segment from `Azure-AsyncOperation` header |
 > | `{CID}`                       | Clusters Service internal cluster ID                    |
+> | `{HCP_NS}`                    | Control plane ns: `ocm-{prefix}-{cid}-{cluster_name}`   |
+> | `{MANAGED_RESOURCE_GROUP}`    | Managed RG name (from Step 1 in §3)                     |
 >
 
 > **Schema gotcha** (from Kusto Cookbook): `frontendLogs.level` and `backendLogs.level` are **UPPERCASE** — use `level == "ERROR"`, not `"error"`.
@@ -246,39 +248,124 @@ CS logs are only mildly helpful for delete failures. They rarely contain the roo
 
 **Symptom:** VMs, NICs, disks, or load balancers remain in the managed resource group after deletion stalls or completes.
 
+This scenario is often **not a Kusto-first problem**. Once the control plane namespace is gone, CAPZ/`capi-provider` pods no longer emit logs — empty CAPZ queries are expected. Use Kusto to find the managed RG and (if the CP was still alive during the window) the Azure delete failure; then inventory and clean up in Azure.
+
+Split the case early:
+
+| Case | Signal | Where the answer lives |
+| ---- | ------ | ---------------------- |
+| A. Deletion still stuck | HostedCluster / CP ns still present; CS `uninstalling` | CAPZ + HyperShift + K8s events (Steps 2–4) |
+| B. Deletion already finished | ARM/CS 404, but managed RG still has resources | Azure Resource Graph / `az` (Step 5) — Kusto only for MRG name + historical errors |
+
+
 ### Step 1: Identify the managed resource group
 
+Cosmos dumps use the **internal** document shape: `properties.customerProperties.platform.*` (not `properties.platform.*`). Prefer the last dump **before** the cluster document disappeared; widen `{START_TIME}` if the cluster is already gone.
+
 ```kql
+// Preferred: cluster datadump (internal Cosmos shape)
 cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | where timestamp between ({START_TIME} .. {END_TIME})
 | where container_name == 'aro-hcp-backend'
 | where log.controller_name == 'datadump'
 | where log.content.resourceID =~ '{RESOURCE_ID}'
-| summarize content = take_any(log.content), observedTime = min(timestamp) by etag = tostring(log.content._etag)
+| summarize content = take_any(log.content), observedTime = max(timestamp) by etag = tostring(log.content._etag)
 | top 1 by observedTime desc
 | extend content = parse_json(content)
-| project managedResourceGroup = tostring(content.properties.platform.managedResourceGroup),
-          subnetId = tostring(content.properties.platform.subnetId)
+| project observedTime,
+          managedResourceGroup = tostring(content.properties.customerProperties.platform.managedResourceGroup),
+          subnetId = tostring(content.properties.customerProperties.platform.subnetId),
+          nsgId = tostring(content.properties.customerProperties.platform.networkSecurityGroupId)
 ```
 
-
-
-### Step 2: CAPZ deletion errors
-
-Uses the structured CAPZ log pattern from `hcpctl snapshot` (aligned with Kusto Cookbook L4 queries):
+If that returns empty MRG fields, try billing dumps (field is top-level on the billing document) or a string search:
 
 ```kql
-cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').containerLogs
+// Fallback A: billing dump — content.managedResourceGroup
+cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | where timestamp between ({START_TIME} .. {END_TIME})
-| where namespace_name has '{CID}'
+| where container_name == 'aro-hcp-backend'
+| where log.controller_name == 'billingdump'
+| where log.resource_id =~ '{RESOURCE_ID}'
+    or log.currentResourceID =~ '{RESOURCE_ID}'
+    or tostring(log.content.resourceId) =~ '{RESOURCE_ID}'
+| project timestamp,
+          managedResourceGroup = tostring(log.content.managedResourceGroup)
+| where isnotempty(managedResourceGroup)
+| top 1 by timestamp desc
+```
+
+```kql
+// Fallback B: any backend log that mentioned the field (works after cluster doc is gone)
+cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where container_name == 'aro-hcp-backend'
+| where tostring(log) has '{RESOURCE_ID}' and tostring(log) has 'managedResourceGroup'
+| extend mrg = extract(@'managedResourceGroup["\']?\s*[:=]\s*["\']?([^"\'\\s,}]+)', 1, tostring(log))
+| where isnotempty(mrg)
+| distinct mrg
+```
+
+```bash
+# Fallback C: Azure — RGs managedBy the cluster ARM ID
+az group list --subscription '{SUBSCRIPTION_ID}' \
+  --query "[?managedBy!=null && contains(to_lower(managedBy), to_lower('{RESOURCE_ID}'))].{name:name, managedBy:managedBy}" -o table
+```
+
+Save `{MANAGED_RESOURCE_GROUP}` for later steps.
+
+
+### Step 2: Confirm whether the control plane was still logging
+
+CAPZ runs in the **control plane namespace** (`{HCP_NS}` = `ocm-{prefix}-{cid}-{cluster_name}`), not the HostedCluster namespace. If this returns nothing, skip to Step 5 — there is no live CAPZ signal to mine.
+
+```kql
+// Any capi-provider traffic in the CP namespace during the window?
+cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').table('containerLogs')
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where namespace_name == '{HCP_NS}' or namespace_name has '{CID}'
 | where pod_name has 'capi-provider-'
-| extend msg = extract(@']\s+"([^"]+)"', 1, tostring(log))
-| extend err = extract(@'err="((?:[^"\\]|\\.)*)"', 1, tostring(log))
-| extend name = extract(@'\sname="([^"]*)"', 1, tostring(log))
-| where isnotempty(err) or msg has_any ('AuthorizationFailed', 'OperationNotAllowed', 'Throttling', 'TooManyRequests', 'ResourceGroupNotFound')
+| summarize rows = count(), first_seen = min(timestamp), last_seen = max(timestamp) by namespace_name
+```
+
+> Prefer exact `namespace_name == '{HCP_NS}'`. `has '{CID}'` is a discovery aid only — it can match the wrong ns if multiple clusters share a prefix collision (rare).
+
+
+### Step 3: CAPZ Azure delete failures (only if Step 2 returned rows)
+
+Match the `hcpctl snapshot` CAPZ query: parse structured fields, keep **all** azure-controller lines with an `err`, then summarize. Do **not** pre-filter to a short Azure error-code list — that often yields empty results when the extract patterns miss or the failure is phrased differently.
+
+```kql
+// Broad CAPZ azure-controller errors (hcpctl clusterAPIProviderLogs pattern)
+cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').table('containerLogs')
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where namespace_name == '{HCP_NS}'
+| where pod_name has 'capi-provider-'
+| extend log_str = tostring(log)
+| extend msg = extract(@']\s+"([^"]+)"', 1, log_str)
+| extend err = extract(@'err="((?:[^"\\]|\\.)*)"', 1, log_str)
+| extend controller = extract(@'controller="([^"]*)"', 1, log_str)
+| extend name = extract(@'\sname="([^"]*)"', 1, log_str)
+| where controller has 'azure'
+| where isnotempty(err)
 | summarize first_occurrence = min(timestamp), last_occurrence = max(timestamp), occurrences = count()
-    by msg, err, name
-| order by first_occurrence asc
+    by msg, err, controller, name
+| order by occurrences desc
+```
+
+If the summarize is still empty, dump raw lines (log format may not match the extract regexes):
+
+```kql
+// Raw CAPZ lines — use when structured extracts return nothing
+cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').table('containerLogs')
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where namespace_name == '{HCP_NS}'
+| where pod_name has 'capi-provider-'
+| extend log_str = tostring(log)
+| where log_str has_any ('error', 'failed', 'delet', 'AuthorizationFailed', 'ResourceGroupNotFound', 'OperationNotAllowed', 'Throttling', 'AADSTS')
+| project timestamp, log_str
+| order by timestamp desc
+| take 100
 ```
 
 
@@ -288,7 +375,77 @@ cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').containerLogs
 | `ResourceGroupNotFound`          | Managed RG deleted externally            |
 | `OperationNotAllowed`            | Resource locks or deny assignments       |
 | `Throttling` / `TooManyRequests` | Azure API rate limits                    |
+| `AADSTS700016` / identity missing | See [§5](#5-deletion-blocked-by-missing-managed-identities) |
 
+
+### Step 4: HyperShift `CloudResourcesDestroyed` + K8s Warning events
+
+```kql
+// HostedCluster conditions from kube-applier readdesire dumps
+cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where container_name == 'aro-hcp-backend'
+| where log.controller_name == 'datadump'
+| where log.resource_group == '{RESOURCE_GROUP}'
+| where log.resource_name == '{CLUSTER_NAME}'
+| where log.content.resourceType =~ 'microsoft.redhatopenshift/hcpopenshiftclusters/readdesires'
+| summarize content = take_any(log.content), observedTime = take_any(timestamp) by etag = tostring(log.content._etag)
+| sort by tolong(content._ts) asc
+| extend content = parse_json(content)
+| extend manifest = content.properties.status.kubeContent
+| where manifest.kind == 'HostedCluster'
+| mv-expand condition = manifest.status.conditions
+| where tostring(condition.type) in ('CloudResourcesDestroyed', 'InfrastructureReady')
+| project observedTime,
+          type = tostring(condition.type),
+          status = tostring(condition.status),
+          reason = tostring(condition.reason),
+          message = tostring(condition.message),
+          lastTransitionTime = todatetime(condition.lastTransitionTime)
+| order by lastTransitionTime asc
+```
+
+`CloudResourcesDestroyed=False` means HyperShift never finished Azure cleanup — correlate with CAPZ errors above.
+
+```kql
+// Warning events in the CP namespace (often clearer than container logs)
+cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').table('kubernetesEvents')
+| where timestamp between ({START_TIME} .. {END_TIME})
+| where eventNamespace == '{HCP_NS}' or eventNamespace has '{CID}'
+| where kubeEventType == 'Warning'
+| project timestamp, objectKind, objectName, reason, message, sourceComponent, count
+| order by timestamp desc
+| take 100
+```
+
+
+### Step 5: Inventory what is actually orphaned (Azure)
+
+Run this whenever Step 2 is empty, or after you have `{MANAGED_RESOURCE_GROUP}` from Step 1. Resource Graph / `az` is the source of truth for leftovers.
+
+```kql
+// Azure Resource Graph Explorer (not regional HCP Kusto)
+Resources
+| where subscriptionId =~ '{SUBSCRIPTION_ID}'
+| where resourceGroup =~ '{MANAGED_RESOURCE_GROUP}'
+| project name, type, location
+| order by type asc, name asc
+```
+
+```bash
+az resource list --subscription '{SUBSCRIPTION_ID}' -g '{MANAGED_RESOURCE_GROUP}' -o table
+```
+
+
+| Orphan type | Likely cause | Fix |
+| ----------- | ------------ | --- |
+| VMs / VMSS | CAPZ could not delete AzureMachine (auth/lock/identity) | Fix RBAC/locks or remove AzureMachine finalizers; then delete VMs |
+| NICs / disks | Partial CAPZ cleanup | Delete remaining NICs/disks after VMs are gone |
+| Load balancer / DNS zone | CS destructor skipped or failed | Delete manually; check CS destruct-chain messages |
+| Empty managed RG | Resources gone, RG not deleted | `az group delete -n '{MANAGED_RESOURCE_GROUP}'` |
+| UAMIs in **customer** RG | Pre-created by customer | Not cleaned by ARO-HCP by design |
+
+Public-cloud managed RGs may have deny assignments — escalate for FPA cleanup if direct delete is blocked. Break-glass remediation: [cleanup-stuck-cluster-deletion.md](cleanup-stuck-cluster-deletion.md).
 
 ---
 
@@ -415,7 +572,7 @@ Non-empty `maestroReadonlyBundles` blocks `NodePoolDeletionController`.
 
 ### Step 6: CAPZ and drain stalls
 
-Run the CAPZ query from [§3 Step 2](#step-2-capz-deletion-errors) scoped to `{CID}` and filter for `{NODEPOOL_NAME}`.
+If the node pool's control plane namespace still has CAPZ traffic, run the CAPZ queries from [§3 Steps 2–3](#step-2-confirm-whether-the-control-plane-was-still-logging) with `{HCP_NS}` / `{CID}` and filter raw lines for `{NODEPOOL_NAME}`.
 
 **Drain-related stalls:** If `nodeDrainTimeoutMinutes` is `0`, delete waits indefinitely for PDB-blocked evictions — confirm via `az resource show` on the node pool properties (Node Pool Management TSG Step 6).
 
@@ -679,10 +836,14 @@ See [logging.md](../logging.md) and the [Kusto Cookbook](https://dev.azure.com/m
 | Table                                  | Database               | Deletion debugging                                             |
 | -------------------------------------- | ---------------------- | -------------------------------------------------------------- |
 | `frontendLogs`                         | ServiceLogs            | DELETE 202, async op polling                                   |
-| `backendLogs`                          | ServiceLogs            | `datadump`, `csstatedump`, controller conditions, cloud errors |
+| `backendLogs`                          | ServiceLogs            | `datadump`, `billingdump`, `csstatedump`, controller conditions |
 | `clustersServiceLogs`                  | ServiceLogs            | CS phase transitions, `cid`, destruct chain                    |
 | `containerLogs`                        | Both                   | Maestro, HyperShift operator                                   |
-| `HostedControlPlaneLogs.containerLogs` | HostedControlPlaneLogs | CAPZ, CAPI manager                                             |
+| `HostedControlPlaneLogs.containerLogs` | HostedControlPlaneLogs | CAPZ (`capi-provider`), CAPI manager                           |
+| `kubernetesEvents`                     | HostedControlPlaneLogs | CP-namespace Warning events during Azure cleanup               |
+
+
+> **Datadump shape gotcha:** cluster Cosmos dumps use `log.content.properties.customerProperties.platform.managedResourceGroup`, not `properties.platform.*`.
 
 
 
