@@ -13,8 +13,6 @@ Correlated Microsoft TSG sources (do not duplicate their runbook steps here):
 | [ARO-HCP query cookbook](../ai/query-cookbook.md)                                                                                                                                                                         | `hcpctl snapshot` canned queries                                   |
 
 
-
-
 ## Failure modes
 
 1. [Cluster Stuck in Deleting](#1-cluster-stuck-in-deleting)
@@ -22,8 +20,6 @@ Correlated Microsoft TSG sources (do not duplicate their runbook steps here):
 3. [Orphaned Azure Resources](#3-orphaned-azure-resources)
 4. [Node Pool Delete Stuck](#4-node-pool-delete-stuck)
 5. [Deletion Blocked by Missing Managed Identities](#5-deletion-blocked-by-missing-managed-identities)
-
-
 
 ## Prerequisites
 
@@ -53,8 +49,6 @@ Correlated Microsoft TSG sources (do not duplicate their runbook steps here):
 >
 
 > **Schema gotcha** (from Kusto Cookbook): `frontendLogs.level` and `backendLogs.level` are **UPPERCASE** — use `level == "ERROR"`, not `"error"`.
-
-
 
 ## Deletion architecture
 
@@ -98,8 +92,6 @@ Clusters Service (sets state to "uninstalling")
 
 ---
 
-
-
 ## Step 0: Discovery — map Resource ID to internal identifiers
 
 Run this before layer-specific queries (aligned with Kusto Cookbook Step 0). You need `{CID}` for HyperShift/CAPZ queries.
@@ -124,7 +116,28 @@ If CID lookup returns nothing, widen the window to `ago(7d)` or confirm the corr
 
 **Symptom:** Cluster stays in `provisioningState: Deleting` well beyond the deletion SLO or the async ARM operation stays `InProgress` with no sign of progress.
 
+### Live debugging
 
+```bash
+# ARM / RP view
+az resource show --ids '{RESOURCE_ID}' \
+  --query "{provisioningState:properties.provisioningState, deletionTimestamp:properties.serviceProviderProperties.deletionTimestamp}" -o json
+
+# Management cluster — is HyperShift still deleting?
+hcpctl mc breakglass <mc-name> && export KUBECONFIG=<path-from-output>
+kubectl get hostedcluster -A | grep '{CID}'
+kubectl get hostedcluster -n "ocm-${CLUSTER_PREFIX}-{CID}" '{CLUSTER_NAME}' \
+  -o jsonpath='{.status.conditions}' | jq '.[] | select(.type|test("Progressing|Degraded|CloudResourcesDestroyed|Available"))'
+kubectl get nodepool -n "ocm-${CLUSTER_PREFIX}-{CID}" -o wide
+kubectl logs -n hypershift deployment/operator --tail=100 --since=1h | grep -E '{CID}|{CLUSTER_NAME}'
+
+# What is holding the control-plane namespace?
+kubectl get ns "{HCP_NS}" -o json | jq '.status.conditions[]? | select(.type=="NamespaceContentRemaining")'
+kubectl get azuremachines.infrastructure.cluster.x-k8s.io,machines.cluster.x-k8s.io \
+  -n "{HCP_NS}" -o custom-columns=KIND:.kind,NAME:.metadata.name,DELETION:.metadata.deletionTimestamp,FINALIZERS:.metadata.finalizers
+```
+
+If node pools are still present with a `deletionTimestamp`, jump to [§4](#4-node-pool-delete-stuck). Full break-glass cleanup: [cleanup-stuck-cluster-deletion.md](cleanup-stuck-cluster-deletion.md).
 
 ### Step 1: HyperShift operator and CAPI manager
 
@@ -167,11 +180,43 @@ failed to remove finalizer from hostedcluster: hostedclusters.hypershift.openshi
 
 ---
 
-
-
 ## 2. Delete Operation Fails
 
 **Symptom:** Operation ends in `Failed`; cluster resource may still exist.
+
+### Live debugging
+
+```bash
+# Service cluster — CS state + Maestro bundles for this CID
+hcpctl sc breakglass <svc-name> && export KUBECONFIG=<path-from-output>
+
+kubectl exec -n clusters-service deployment/clusters-service -c clusters-service-server -- \
+  curl -s "http://localhost:8000/api/clusters_mgmt/v1/clusters/{CID}" | \
+  jq '{id, name, state, status}'
+
+kubectl exec -n maestro deployment/maestro -c maestro-server -- sh -c \
+  "curl -s 'http://localhost:8000/api/maestro/v1/resource-bundles?size=2900'" | \
+  jq --arg cid '{CID}' '[.items[] | select(.manifests | tostring | test($cid)) |
+    {id, name, deleted_at: .metadata.deleted_at, labels: .metadata.labels, consumer_name}]'
+
+# Namespace-only orphans often block CS destruct
+kubectl exec -n maestro deployment/maestro -c maestro-server -- sh -c \
+  "curl -s 'http://localhost:8000/api/maestro/v1/resource-bundles?size=2900'" | \
+  jq --arg cid '{CID}' '[.items[] | select(.manifests | tostring | test($cid)) |
+    select(.metadata.labels.containsNamespaces == "true" or (.name | test("namespaces"))) |
+    {id, name, deleted_at: .metadata.deleted_at}]'
+
+# Management cluster — ManifestWork delivery vs missing CP namespace
+hcpctl mc breakglass <mc-name> && export KUBECONFIG=<path-from-output>
+kubectl get manifestwork -n local-cluster -l "api.openshift.com/id={CID}" -o wide
+kubectl get manifestwork -n local-cluster -l "api.openshift.com/id={CID}" -o json | \
+  jq '.items[] | {name: .metadata.name, deletionTimestamp: .metadata.deletionTimestamp,
+      conditions: [.status.conditions[]? | {type, status, reason, message}]}'
+kubectl get ns | grep '{CID}' || echo "CP / HC namespaces already gone"
+kubectl logs -n maestro deployment/maestro-agent -c maestro-agent --tail=80 --since=1h | grep '{CID}'
+```
+
+Stale ResourceBundle + missing namespace → [fix-maestro-stale-resource-bundle.md](fix-maestro-stale-resource-bundle.md).
 
 ### Step 1: Backend cloud errors
 
@@ -189,8 +234,6 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 Example failures
 
 - Manifest work deletion is stuck
-
-
 
 ### Step 2: Maestro server and agent
 
@@ -242,25 +285,49 @@ CS logs are only mildly helpful for delete failures. They rarely contain the roo
 
 ---
 
-
-
 ## 3. Orphaned Azure Resources
 
 **Symptom:** VMs, NICs, disks, or load balancers remain in the managed resource group after deletion stalls or completes.
 
 This scenario is often **not a Kusto-first problem**. Once the control plane namespace is gone, CAPZ/`capi-provider` pods no longer emit logs — empty CAPZ queries are expected. Use Kusto to find the managed RG and (if the CP was still alive during the window) the Azure delete failure; then inventory and clean up in Azure.
 
+### Live debugging
+
+```bash
+# Find managed RG (customer subscription)
+az group list --subscription '{SUBSCRIPTION_ID}' \
+  --query "[?managedBy!=null && contains(to_lower(managedBy), to_lower('{RESOURCE_ID}'))].{name:name, managedBy:managedBy}" -o table
+
+# Inventory leftovers
+az resource list --subscription '{SUBSCRIPTION_ID}' -g '{MANAGED_RESOURCE_GROUP}' \
+  --query "[].{name:name, type:type, location:location}" -o table
+
+# Locks / deny that block CAPZ deletes
+az lock list --subscription '{SUBSCRIPTION_ID}' -g '{MANAGED_RESOURCE_GROUP}' -o table
+az role assignment list --subscription '{SUBSCRIPTION_ID}' -g '{MANAGED_RESOURCE_GROUP}' \
+  --include-inherited --query "[?contains(roleDefinitionName, 'Deny') || principalType=='ServicePrincipal'].{principal:principalName, role:roleDefinitionName, scope:scope}" -o table
+
+# If CP ns still exists — live CAPZ signal
+hcpctl mc breakglass <mc-name> && export KUBECONFIG=<path-from-output>
+kubectl get pods -n "{HCP_NS}" -l cluster.x-k8s.io/provider=infrastructure-azure -o wide
+kubectl logs -n "{HCP_NS}" -l cluster.x-k8s.io/provider=infrastructure-azure -c manager --tail=100 --since=1h | \
+  grep -iE 'error|failed|AuthorizationFailed|ResourceGroupNotFound|AADSTS|Throttl'
+kubectl get azuremachines.infrastructure.cluster.x-k8s.io -n "{HCP_NS}" -o yaml | \
+  grep -E 'deletionTimestamp|finalizers|failureMessage|failureReason|providerID' -A2
+```
+
 Split the case early:
 
-| Case | Signal | Where the answer lives |
-| ---- | ------ | ---------------------- |
-| A. Deletion still stuck | HostedCluster / CP ns still present; CS `uninstalling` | CAPZ + HyperShift + K8s events (Steps 2–4) |
-| B. Deletion already finished | ARM/CS 404, but managed RG still has resources | Azure Resource Graph / `az` (Step 5) — Kusto only for MRG name + historical errors |
+
+| Case                         | Signal                                                 | Where the answer lives                                                             |
+| ---------------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| A. Deletion still stuck      | HostedCluster / CP ns still present; CS `uninstalling` | CAPZ + HyperShift + K8s events (Steps 2–4)                                         |
+| B. Deletion already finished | ARM/CS 404, but managed RG still has resources         | Azure Resource Graph / `az` (Step 5) — Kusto only for MRG name + historical errors |
 
 
 ### Step 1: Identify the managed resource group
 
-Cosmos dumps use the **internal** document shape: `properties.customerProperties.platform.*` (not `properties.platform.*`). Prefer the last dump **before** the cluster document disappeared; widen `{START_TIME}` if the cluster is already gone.
+Cosmos dumps use the **internal** document shape: `properties.customerProperties.platform.`* (not `properties.platform.*`). Prefer the last dump **before** the cluster document disappeared; widen `{START_TIME}` if the cluster is already gone.
 
 ```kql
 // Preferred: cluster datadump (internal Cosmos shape)
@@ -314,7 +381,6 @@ az group list --subscription '{SUBSCRIPTION_ID}' \
 
 Save `{MANAGED_RESOURCE_GROUP}` for later steps.
 
-
 ### Step 2: Confirm whether the control plane was still logging
 
 CAPZ runs in the **control plane namespace** (`{HCP_NS}` = `ocm-{prefix}-{cid}-{cluster_name}`), not the HostedCluster namespace. If this returns nothing, skip to Step 5 — there is no live CAPZ signal to mine.
@@ -329,7 +395,6 @@ cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').table('contain
 ```
 
 > Prefer exact `namespace_name == '{HCP_NS}'`. `has '{CID}'` is a discovery aid only — it can match the wrong ns if multiple clusters share a prefix collision (rare).
-
 
 ### Step 3: CAPZ Azure delete failures (only if Step 2 returned rows)
 
@@ -369,12 +434,12 @@ cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').table('contain
 ```
 
 
-| Error                            | Likely cause                             |
-| -------------------------------- | ---------------------------------------- |
-| `AuthorizationFailed`            | Managed identity lost delete permissions |
-| `ResourceGroupNotFound`          | Managed RG deleted externally            |
-| `OperationNotAllowed`            | Resource locks or deny assignments       |
-| `Throttling` / `TooManyRequests` | Azure API rate limits                    |
+| Error                             | Likely cause                                                |
+| --------------------------------- | ----------------------------------------------------------- |
+| `AuthorizationFailed`             | Managed identity lost delete permissions                    |
+| `ResourceGroupNotFound`           | Managed RG deleted externally                               |
+| `OperationNotAllowed`             | Resource locks or deny assignments                          |
+| `Throttling` / `TooManyRequests`  | Azure API rate limits                                       |
 | `AADSTS700016` / identity missing | See [§5](#5-deletion-blocked-by-missing-managed-identities) |
 
 
@@ -402,7 +467,7 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
           reason = tostring(condition.reason),
           message = tostring(condition.message),
           lastTransitionTime = todatetime(condition.lastTransitionTime)
-| order by lastTransitionTime asc
+| order by lastTransitionTime desc
 ```
 
 `CloudResourcesDestroyed=False` means HyperShift never finished Azure cleanup — correlate with CAPZ errors above.
@@ -417,7 +482,6 @@ cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').table('kuberne
 | order by timestamp desc
 | take 100
 ```
-
 
 ### Step 5: Inventory what is actually orphaned (Azure)
 
@@ -437,25 +501,50 @@ az resource list --subscription '{SUBSCRIPTION_ID}' -g '{MANAGED_RESOURCE_GROUP}
 ```
 
 
-| Orphan type | Likely cause | Fix |
-| ----------- | ------------ | --- |
-| VMs / VMSS | CAPZ could not delete AzureMachine (auth/lock/identity) | Fix RBAC/locks or remove AzureMachine finalizers; then delete VMs |
-| NICs / disks | Partial CAPZ cleanup | Delete remaining NICs/disks after VMs are gone |
-| Load balancer / DNS zone | CS destructor skipped or failed | Delete manually; check CS destruct-chain messages |
-| Empty managed RG | Resources gone, RG not deleted | `az group delete -n '{MANAGED_RESOURCE_GROUP}'` |
-| UAMIs in **customer** RG | Pre-created by customer | Not cleaned by ARO-HCP by design |
+| Orphan type              | Likely cause                                            | Fix                                                               |
+| ------------------------ | ------------------------------------------------------- | ----------------------------------------------------------------- |
+| VMs / VMSS               | CAPZ could not delete AzureMachine (auth/lock/identity) | Fix RBAC/locks or remove AzureMachine finalizers; then delete VMs |
+| NICs / disks             | Partial CAPZ cleanup                                    | Delete remaining NICs/disks after VMs are gone                    |
+| Load balancer / DNS zone | CS destructor skipped or failed                         | Delete manually; check CS destruct-chain messages                 |
+| Empty managed RG         | Resources gone, RG not deleted                          | `az group delete -n '{MANAGED_RESOURCE_GROUP}'`                   |
+| UAMIs in **customer** RG | Pre-created by customer                                 | Not cleaned by ARO-HCP by design                                  |
+
 
 Public-cloud managed RGs may have deny assignments — escalate for FPA cleanup if direct delete is blocked. Break-glass remediation: [cleanup-stuck-cluster-deletion.md](cleanup-stuck-cluster-deletion.md).
 
 ---
-
-
 
 ## 4. Node Pool Delete Stuck
 
 **Symptom:** Node pool stays in `provisioningState: Deleting` for hours. Covered in detail by the [Node Pool Management TSG](https://dev.azure.com/msazure/One/_git/Azure-Documents-Common?path=/Teams/Azure%20RedHat%20OpenShift/doc/hcp/troubleshooting/node-pool-management-tsg.md) (drain timeout, last-pool validation, CAPI machine state).
 
 **Not a Kusto failure:** `"The last node pool can not be deleted"` is an admission/validation rejection — customer must add a second node pool first.
+
+### Live debugging
+
+```bash
+# ARM — still deleting? drain timeout / last-pool rejection?
+az resource show --ids '{NODEPOOL_RESOURCE_ID}' \
+  --query "{provisioningState:properties.provisioningState, nodeDrainTimeoutMinutes:properties.nodeDrainTimeoutMinutes, replicas:properties.replicas}" -o json
+az rest --method get \
+  --url "https://management.azure.com{RESOURCE_ID}/nodePools?api-version=2024-06-10-preview" | \
+  jq '.value[] | {name: .name, state: .properties.provisioningState}'
+
+# Management cluster — NodePool + Machines for this pool
+hcpctl mc breakglass <mc-name> && export KUBECONFIG=<path-from-output>
+HC_NS="ocm-${CLUSTER_PREFIX}-{CID}"
+kubectl get nodepool -n "$HC_NS" '{NODEPOOL_NAME}' -o yaml | \
+  jq '{deletionTimestamp: .metadata.deletionTimestamp, finalizers: .metadata.finalizers,
+       conditions: [.status.conditions[]? | {type, status, reason, message}]}'
+kubectl get machines.cluster.x-k8s.io,azuremachines.infrastructure.cluster.x-k8s.io -n "{HCP_NS}" \
+  -l "hypershift.openshift.io/nodePool={NODEPOOL_NAME}" \
+  -o custom-columns=KIND:.kind,NAME:.metadata.name,PHASE:.status.phase,DELETION:.metadata.deletionTimestamp,FINALIZERS:.metadata.finalizers
+
+# Drain / eviction stalls (PDB / stuck pods on worker nodes owned by this pool)
+kubectl get events -n "{HCP_NS}" --field-selector type=Warning --sort-by='.lastTimestamp' | tail -40
+kubectl logs -n "{HCP_NS}" -l cluster.x-k8s.io/provider=infrastructure-azure -c manager --tail=80 --since=1h | \
+  grep -iE '{NODEPOOL_NAME}|drain|evict|timeout|failed'
+```
 
 ### Step 1: Confirm delete accepted
 
@@ -468,8 +557,6 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('frontendLogs')
 | project timestamp, response_status_code, correlation_request_id, client_request_id
 | order by timestamp desc
 ```
-
-
 
 ### Step 2: Node pool Cosmos document state
 
@@ -497,8 +584,6 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | `deletionTimestamp` set, `clusterServiceDeletionTimestamp` null | `NodePoolClusterServiceDeleteDispatch`                         |
 | `clusterServiceID` still set                                    | Waiting for CS 404 (`NodePoolDeletionClusterServiceIDClearer`) |
 | Both CS fields cleared, doc still present                       | Maestro bundles or child docs (`NodePoolDeletionController`)   |
-
-
 
 
 ### Step 3: Node pool deletion controller conditions
@@ -551,8 +636,6 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | project csNodePool
 ```
 
-
-
 ### Step 5: Maestro readonly bundles blocking delete
 
 ```kql
@@ -578,11 +661,34 @@ If the node pool's control plane namespace still has CAPZ traffic, run the CAPZ 
 
 ---
 
-
-
 ## 5. Deletion Blocked by Missing Managed Identities
 
 **Symptom:** Cluster or node pool deletion stuck; CAPZ logs show AAD errors like `AADSTS700016: Application with identifier '...' was not found`. Full remediation is in the [Managed Identities Not Found runbook](https://dev.azure.com/msazure/One/_git/Azure-Documents-Common?path=/Teams/Azure%20RedHat%20OpenShift/doc/hcp/runbooks/cluster-deletion/managed-identities-not-found.md).
+
+### Live debugging
+
+```bash
+# Management cluster — CAPZ AAD errors + AzureMachines stuck on identity
+hcpctl mc breakglass <mc-name> && export KUBECONFIG=<path-from-output>
+kubectl logs -n "{HCP_NS}" -l cluster.x-k8s.io/provider=infrastructure-azure -c manager --tail=200 --since=2h | \
+  grep -iE 'AADSTS|Application with identifier|AuthorizationFailed|was not found'
+
+kubectl get azuremachines.infrastructure.cluster.x-k8s.io -n "{HCP_NS}" -o json | \
+  jq '.items[] | {name: .metadata.name,
+      deletionTimestamp: .metadata.deletionTimestamp,
+      finalizers: .metadata.finalizers,
+      identity: .spec.identity, userAssignedIdentities: .spec.userAssignedIdentities,
+      failureMessage: .status.failureMessage, failureReason: .status.failureReason}'
+
+# Customer subscription — are the UAMIs still present?
+# Client IDs from CAPZ / AzureMachine errors above
+az identity list --subscription '{SUBSCRIPTION_ID}' -g '{RESOURCE_GROUP}' \
+  --query "[].{name:name, clientId:clientId, principalId:principalId}" -o table
+az identity show --subscription '{SUBSCRIPTION_ID}' -g '{RESOURCE_GROUP}' -n '<identity-name>' -o json 2>&1
+
+# Only when machines already have deletionTimestamp and identity is confirmed gone:
+# remove azuremachine finalizers per the external runbook / cleanup-stuck-cluster-deletion.md
+```
 
 ### Step 1: Confirm backend saw a delete failure
 
@@ -598,8 +704,6 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | project timestamp, level, msg, operation, operation_id, resource_id, cloud_error_code, cloud_error_message
 | order by timestamp asc
 ```
-
-
 
 ### Step 2: CAPZ AAD / identity errors
 
@@ -619,11 +723,39 @@ cluster('{KUSTO_CLUSTER_URI}').database('HostedControlPlaneLogs').containerLogs
 
 ---
 
-
-
 ## 6. Deep dive into cluster deletion workflow
 
+### Live debugging (layer walk)
 
+Use this when Kusto shows the delete was accepted but you need a live “where is it stuck?” sweep. Work top-down; stop at the first broken layer.
+
+```bash
+# 1) RP — provisioningState + async op (port-forward on SVC if needed)
+hcpctl sc breakglass <svc-name> && export KUBECONFIG=<path-from-output>
+kubectl port-forward -n aro-hcp svc/aro-hcp-frontend 8443:8443 &
+curl -sk "https://localhost:8443{RESOURCE_ID}?api-version=2024-06-10-preview" | \
+  jq '{name: .name, provisioningState: .properties.provisioningState}'
+
+# 2) CS — must be uninstalling (or 404 if CS finished)
+kubectl exec -n clusters-service deployment/clusters-service -c clusters-service-server -- \
+  curl -s "http://localhost:8000/api/clusters_mgmt/v1/clusters/{CID}" | jq '{id, name, state}'
+
+# 3) Maestro — any leftover bundles (incl. namespace-only)?
+kubectl exec -n maestro deployment/maestro -c maestro-server -- sh -c \
+  "curl -s 'http://localhost:8000/api/maestro/v1/resource-bundles?size=2900'" | \
+  jq --arg cid '{CID}' '[.items[] | select(.manifests | tostring | test($cid)) | {id, name, deleted_at: .metadata.deleted_at}]'
+
+# 4) MGMT — ManifestWork → HostedCluster → CP ns blockers
+hcpctl mc breakglass <mc-name> && export KUBECONFIG=<path-from-output>
+kubectl get manifestwork,managedcluster -A 2>/dev/null | grep '{CID}'
+kubectl get hostedcluster,nodepool -n "ocm-${CLUSTER_PREFIX}-{CID}" -o wide
+kubectl get ns "{HCP_NS}" -o json | jq '.status.phase, .status.conditions'
+kubectl get hostedcontrolplanes.hypershift.openshift.io,clusters.cluster.x-k8s.io,\
+azuremachines.infrastructure.cluster.x-k8s.io,machines.cluster.x-k8s.io -n "{HCP_NS}" \
+  -o custom-columns=KIND:.kind,NAME:.metadata.name,DELETION:.metadata.deletionTimestamp,FINALIZERS:.metadata.finalizers
+```
+
+Remediation when a layer is confirmed stuck: [cleanup-stuck-cluster-deletion.md](cleanup-stuck-cluster-deletion.md).
 
 ### Step 1: Confirm the delete request was accepted
 
@@ -689,8 +821,6 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | `deletionTimestamp` set, `clusterServiceDeletionTimestamp` null | CS delete never dispatched |
 | `clusterServiceID` still present                                | CS has not confirmed 404   |
 | `activeOperationID` empty while `Deleting`                      | Broken operation link      |
-
-
 
 
 ### Step 3: Check child node pools blocking cluster deletion
@@ -768,8 +898,6 @@ cluster('{KUSTO_CLUSTER_URI}').database('ServiceLogs').table('backendLogs')
 | `OperationClusterDelete`                 | Could not update the ARM operation status             |
 
 
-
-
 ### Step 5: CS deletion activity
 
 ```kql
@@ -833,20 +961,17 @@ See [logging.md](../logging.md) and the [Kusto Cookbook](https://dev.azure.com/m
 ## Appendix B: Key tables
 
 
-| Table                                  | Database               | Deletion debugging                                             |
-| -------------------------------------- | ---------------------- | -------------------------------------------------------------- |
-| `frontendLogs`                         | ServiceLogs            | DELETE 202, async op polling                                   |
+| Table                                  | Database               | Deletion debugging                                              |
+| -------------------------------------- | ---------------------- | --------------------------------------------------------------- |
+| `frontendLogs`                         | ServiceLogs            | DELETE 202, async op polling                                    |
 | `backendLogs`                          | ServiceLogs            | `datadump`, `billingdump`, `csstatedump`, controller conditions |
-| `clustersServiceLogs`                  | ServiceLogs            | CS phase transitions, `cid`, destruct chain                    |
-| `containerLogs`                        | Both                   | Maestro, HyperShift operator                                   |
-| `HostedControlPlaneLogs.containerLogs` | HostedControlPlaneLogs | CAPZ (`capi-provider`), CAPI manager                           |
-| `kubernetesEvents`                     | HostedControlPlaneLogs | CP-namespace Warning events during Azure cleanup               |
+| `clustersServiceLogs`                  | ServiceLogs            | CS phase transitions, `cid`, destruct chain                     |
+| `containerLogs`                        | Both                   | Maestro, HyperShift operator                                    |
+| `HostedControlPlaneLogs.containerLogs` | HostedControlPlaneLogs | CAPZ (`capi-provider`), CAPI manager                            |
+| `kubernetesEvents`                     | HostedControlPlaneLogs | CP-namespace Warning events during Azure cleanup                |
 
 
-> **Datadump shape gotcha:** cluster Cosmos dumps use `log.content.properties.customerProperties.platform.managedResourceGroup`, not `properties.platform.*`.
-
-
-
+> **Datadump shape gotcha:** cluster Cosmos dumps use `log.content.properties.customerProperties.platform.managedResourceGroup`, not `properties.platform.`*.
 
 ## Appendix C: Related docs
 
